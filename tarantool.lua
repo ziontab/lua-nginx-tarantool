@@ -8,6 +8,26 @@ local ngx    = ngx
 local type   = type
 local ipairs = ipairs
 local error  = error
+local string = string
+local socket
+local decode_base64
+local sha1_bin
+
+-- Use non NGINX modules
+-- requires: luasock (implicit), lua-resty-socket, sha1
+
+if not ngx then
+  socket = require("socket")
+  socket.unix = require("socket.unix")
+  local mime   = require("mime")
+  decode_base64 = mime.unb64
+  local sha1 = require("sha1")
+  sha1_bin = sha1.binary
+else
+  socket = ngx.socket
+  decode_base64 = ngx.decode_base64
+  sha1_bin = ngx.sha1_bin
+end
 
 mp.set_integer('unsigned')
 
@@ -29,7 +49,7 @@ function new(self, params)
         end
     end
 
-    local sock, err = ngx.socket.tcp()
+    local sock, err = socket.tcp()
     if not sock then
         return nil, err
     end
@@ -43,6 +63,10 @@ function new(self, params)
     obj._indexes = {}
     obj = setmetatable(obj, { __index = self })
 
+    if not ngx then
+      obj.unix = socket.unix()
+    end
+
     if obj.connect_now then
         local ok, err = obj:connect()
         if not ok then
@@ -53,7 +77,7 @@ function new(self, params)
     return obj
 end
 
-function wraperr(self,err)
+function wraperr(self, err)
     if err then
         err = err .. ', server: ' .. self.host .. ':' .. self.port
     end
@@ -68,7 +92,20 @@ function connect(self, host, port)
     self.host = host or self.host
     self.port = tonumber(port or self.port)
 
-    local ok, err = self.sock:connect(self.host, self.port)
+    local ok, err
+    if string.find(self.host, 'unix:/') then
+      if ngx then
+        ok, err = self.sock:connect(self.host)
+      else
+        ok, err = self.unix:connect(string.match(self.host, 'unix:(.+)'))
+        if ok then
+          self.sock = self.unix
+        end
+      end
+    else
+      ok, err = self.sock:connect(self.host, self.port)
+    end
+
     if not ok then
         return ok, self:wraperr(err)
     end
@@ -302,17 +339,17 @@ function _resolve_index(self, space, index)
 end
 
 function _handshake(self)
-    local count, err = self.sock:getreusedtimes()
     local greeting, greeting_err
-    if count == 0 then
+    if not self._salt then
         greeting, greeting_err = self.sock:receive(C.GREETING_SIZE)
         if not greeting or greeting_err then
             self.sock:close()
             return nil, self:wraperr(greeting_err)
         end
         self._salt = string.sub(greeting, C.GREETING_SALT_OFFSET + 1)
-        self._salt = string.sub(ngx.decode_base64(self._salt), 1, 20)
-        return self:_authenticate()
+        self._salt = string.sub(decode_base64(self._salt), 1, 20)
+        self.authenticated = self:_authenticate()
+        return self.authenticated
     end
     return true
 end
@@ -326,9 +363,9 @@ function _authenticate(self)
 
     local password = self.password or ''
     if password ~= '' then
-        local step_1   = ngx.sha1_bin(self.password)
-        local step_2   = ngx.sha1_bin(step_1)
-        local step_3   = ngx.sha1_bin(self._salt .. step_2)
+        local step_1   = sha1_bin(self.password)
+        local step_2   = sha1_bin(step_1)
+        local step_3   = sha1_bin(self._salt .. step_2)
         local scramble = _xor(step_1, step_3)
         rbody[C.TUPLE] = { "chap-sha1",  scramble }
     end
